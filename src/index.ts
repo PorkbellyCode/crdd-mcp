@@ -1002,6 +1002,165 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// measure_understanding
+//
+// evaluate_answer로 쌓인 concept별 점수/history를 읽기 전용으로 조회한다.
+// 파일 가중치(현재는 경로 기반 tier)를 반영한 overall과
+// Cognitive Debt(=100-overall)를 계산하고, 마지막 검증 이후 매핑된 파일이
+// 바뀐 concept은 stale로 표시한다. stale이어도 점수를 자동으로 깎지는
+// 않는다 — 감쇠 폭 계산 방식은 아직 미정이라(`CRDD 이해도 점수 유지 설계`
+// 남은 결정 사항) 지금은 재퀴즈를 유도하는 신호로만 쓴다.
+// ---------------------------------------------------------------------------
+
+/** concept에 매핑된 파일들의 tier 가중치 합. 매핑된 파일이 없으면 normal(1)로 취급한다. */
+function computeConceptWeight(files: string[]): number {
+  const sum = files.reduce(
+    (total, file) => total + TIER_WEIGHTS[getFileTier(file)],
+    0
+  );
+  return sum > 0 ? sum : 1;
+}
+
+server.registerTool(
+  "measure_understanding",
+  {
+    title: "Measure Understanding",
+    description:
+      "저장된 이해도 점수(concept별 score)와 파일 가중치를 반영한 overall/Cognitive Debt, 최근 채점 이력을 조회합니다. 마지막 검증 이후 매핑된 파일이 바뀐 concept은 stale로 표시하지만, 점수 자체를 자동으로 깎지는 않습니다 (감쇠 폭 계산 방식은 아직 미정).",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      concept: z
+        .string()
+        .optional()
+        .describe("특정 개념/영역 이름으로 좁혀서 조회 (생략하면 전체 개념 반환)"),
+      historyLimit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("함께 반환할 최근 history 개수 (기본값 20)"),
+    },
+    annotations: {
+      readOnlyHint: true,
+    },
+  },
+  async ({ projectPath, concept, historyLimit }) => {
+    try {
+      const store = loadStore(projectPath);
+      const limit = historyLimit ?? 20;
+
+      if (concept && !store.concepts[concept]) {
+        return textContent({
+          concept,
+          found: false,
+          message: `"${concept}" 개념은 아직 검증된 적이 없습니다. generate_quiz로 퀴즈를 내고 evaluate_answer로 채점 결과를 저장하면 여기에 나타납니다.`,
+        });
+      }
+
+      const conceptNames = concept ? [concept] : Object.keys(store.concepts);
+
+      const conceptDetails = conceptNames.map((name) => {
+        const record = store.concepts[name]!;
+        const weight = computeConceptWeight(record.files);
+
+        let changedFiles: string[] = [];
+        let staleCheckError: string | undefined;
+        if (record.files.length > 0) {
+          try {
+            const diffOutput = runGit(
+              [
+                "diff",
+                "--name-only",
+                `${record.lastVerifiedCommit}..HEAD`,
+                "--",
+                ...record.files,
+              ],
+              projectPath
+            );
+            changedFiles = diffOutput.trim() ? diffOutput.trim().split("\n") : [];
+          } catch (err) {
+            staleCheckError = (err as Error).message;
+          }
+        }
+
+        const detail: {
+          concept: string;
+          score: number;
+          weight: number;
+          files: string[];
+          lastVerifiedCommit: string;
+          lastQuizAt: string;
+          stale: boolean;
+          changedFiles: string[];
+          staleCheckError?: string;
+        } = {
+          concept: name,
+          score: record.score,
+          weight,
+          files: record.files,
+          lastVerifiedCommit: record.lastVerifiedCommit,
+          lastQuizAt: record.lastQuizAt,
+          stale: changedFiles.length > 0,
+          changedFiles,
+        };
+        if (staleCheckError) {
+          detail.staleCheckError = staleCheckError;
+        }
+        return detail;
+      });
+
+      conceptDetails.sort((a, b) => a.score - b.score);
+
+      // 프로젝트 개요 8장 공식(Cognitive Debt = 100 - Understanding)을 그대로
+      // 따른다. 아직 검증된 concept이 하나도 없는 최초 상태는 "계산 불가(null)"가
+      // 아니라 "이해도 0% = 인지부채 100%"인 시작점으로 본다 — null은 "아직 아무
+      // 것도 확인되지 않았다"는 사실은 정확해도, 실제로 쓸 때는 0/100이 훨씬
+      // 직관적이다.
+      let overall: number;
+      let cognitiveDebt: number;
+      if (conceptDetails.length > 0) {
+        const weightedSum = conceptDetails.reduce(
+          (sum, c) => sum + c.weight * c.score,
+          0
+        );
+        const weightTotal = conceptDetails.reduce((sum, c) => sum + c.weight, 0);
+        overall = weightTotal > 0 ? Math.round(weightedSum / weightTotal) : 0;
+        cognitiveDebt = 100 - overall;
+      } else {
+        overall = 0;
+        cognitiveDebt = 100;
+      }
+
+      const recentHistory = store.history
+        .filter((entry) => !concept || entry.concept === concept)
+        .slice()
+        .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+        .slice(0, limit);
+
+      const payload: Record<string, unknown> = {
+        projectId: store.projectId,
+        storePath: getStorePath(store.projectId),
+        overall,
+        cognitiveDebt,
+        concepts: conceptDetails,
+        recentHistory,
+      };
+      if (conceptDetails.length === 0) {
+        payload["message"] =
+          "아직 검증된 개념이 없어 이해도 0%(Cognitive Debt 100%)인 시작점입니다. generate_quiz로 퀴즈를 내고 evaluate_answer로 채점 결과를 저장하면 값이 올라갑니다.";
+      }
+
+      return textContent(payload);
+    } catch (err) {
+      return errorContent(
+        `이해도 점수를 조회하는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // 서버 기동
 // ---------------------------------------------------------------------------
 
