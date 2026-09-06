@@ -161,13 +161,76 @@ function errorContent(message: string) {
 // inspect_project
 // ---------------------------------------------------------------------------
 
+// CRDD 파일 가중치 설계 — 1단계: 경로 기반 tier.
+// AST 없이도 "대충 맞는 우선순위"를 매기기 위한 첫 시그널이다. fan-in(피참조
+// 횟수), 경계/위험 파일 보너스는 다음 단계에서 추가하고, 그때 critical/core
+// tier가 더해진다. 지금은 peripheral(테스트/설정/문서류)과 나머지(normal)
+// 두 단계만 구분한다.
+type FileTier = "peripheral" | "normal";
+
+const TIER_WEIGHTS: Record<FileTier, number> = {
+  peripheral: 0.3,
+  normal: 1,
+};
+
+// 이 이름의 디렉터리 아래에 있는 파일은 peripheral로 본다
+const PERIPHERAL_DIR_NAMES = new Set([
+  "test",
+  "tests",
+  "__tests__",
+  "__mocks__",
+  "docs",
+  "doc",
+  "examples",
+  "example",
+  ".github",
+]);
+
+// 파일명이 이 패턴에 매치하면 peripheral로 본다 (설정/문서/라이선스류)
+const PERIPHERAL_FILE_PATTERNS = [
+  /\.config\.[cm]?[jt]sx?$/i,
+  /^tsconfig(\..+)?\.json$/i,
+  /^\.eslintrc/i,
+  /^\.prettierrc/i,
+  /^vitest\.config/i,
+  /^jest\.config/i,
+  /^README(\.[a-z0-9]+)?$/i,
+  /^CHANGELOG(\.[a-z0-9]+)?$/i,
+  /^LICENSE(\.[a-z0-9]+)?$/i,
+  /\.md$/i,
+];
+
+/** 프로젝트 루트 기준 상대 경로만 보고 tier를 판정한다 (fan-in 없이도 계산 가능) */
+function getFileTier(relativePath: string): FileTier {
+  const segments = relativePath.split("/");
+  const fileName = segments[segments.length - 1] ?? relativePath;
+  const dirSegments = segments.slice(0, -1);
+
+  if (dirSegments.some((segment) => PERIPHERAL_DIR_NAMES.has(segment))) {
+    return "peripheral";
+  }
+  if (PERIPHERAL_FILE_PATTERNS.some((pattern) => pattern.test(fileName))) {
+    return "peripheral";
+  }
+  return "normal";
+}
+
 interface TreeNode {
   name: string;
   type: "file" | "dir";
   children?: TreeNode[];
+  /** 파일에만 표시된다. 경로 기반 tier (fan-in/경계 보너스 반영 전 1단계) */
+  tier?: FileTier;
+  /** TIER_WEIGHTS[tier]와 동일한 값. concept 가중치 계산에 바로 쓸 수 있게 함께 반환 */
+  weight?: number;
 }
 
-function buildTree(dirPath: string, depth: number, maxDepth: number): TreeNode[] {
+function buildTree(
+  dirPath: string,
+  depth: number,
+  maxDepth: number,
+  relPath = ""
+): TreeNode[] {
   if (depth > maxDepth) {
     return [];
   }
@@ -180,14 +243,21 @@ function buildTree(dirPath: string, depth: number, maxDepth: number): TreeNode[]
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => {
       const fullPath = join(dirPath, entry.name);
+      const entryRelPath = relPath ? `${relPath}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         return {
           name: entry.name,
           type: "dir" as const,
-          children: buildTree(fullPath, depth + 1, maxDepth),
+          children: buildTree(fullPath, depth + 1, maxDepth, entryRelPath),
         };
       }
-      return { name: entry.name, type: "file" as const };
+      const tier = getFileTier(entryRelPath);
+      return {
+        name: entry.name,
+        type: "file" as const,
+        tier,
+        weight: TIER_WEIGHTS[tier],
+      };
     });
 }
 
@@ -196,7 +266,7 @@ server.registerTool(
   {
     title: "Inspect Project",
     description:
-      "주어진 프로젝트 루트 경로의 디렉토리 구조를 분석해서 반환합니다. node_modules, .git 같은 노이즈 디렉토리는 제외합니다.",
+      "주어진 프로젝트 루트 경로의 디렉토리 구조를 분석해서 반환합니다. node_modules, .git 같은 노이즈 디렉토리는 제외합니다. 각 파일에는 경로 기반 중요도 tier(peripheral/normal)와 weight가 함께 표시됩니다 — 아직 fan-in/경계 파일 보너스는 반영되지 않은 1단계 근사치입니다.",
     inputSchema: {
       projectPath: z.string().describe("분석할 프로젝트의 절대 경로"),
       maxDepth: z
