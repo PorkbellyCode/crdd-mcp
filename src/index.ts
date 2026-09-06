@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,6 +9,10 @@ const server = new McpServer({
   name: "crdd-mcp",
   version: "0.1.0",
 });
+
+// ---------------------------------------------------------------------------
+// 공통 상수 / 헬퍼
+// ---------------------------------------------------------------------------
 
 // 트리 탐색에서 제외할 노이즈성 디렉토리
 const IGNORE_DIRS = new Set([
@@ -20,6 +24,141 @@ const IGNORE_DIRS = new Set([
   ".turbo",
   "coverage",
 ]);
+
+// 검색 대상에서 제외할 lock 파일 (내용이 크고 이해도와 무관한 노이즈)
+const LOCK_FILES = new Set([
+  "pnpm-lock.yaml",
+  "package-lock.json",
+  "yarn.lock",
+  "bun.lockb",
+  "Cargo.lock",
+  "poetry.lock",
+]);
+
+// 시크릿이 담길 가능성이 높아 LLM 컨텍스트로 올리면 안 되는 파일
+const SENSITIVE_FILE_PATTERNS = [
+  /^\.env($|\.)/,
+  /^id_rsa($|\.)/,
+  /\.pem$/,
+  /\.key$/,
+  /^credentials$/,
+];
+
+const MAX_READ_BYTES = 200 * 1024; // read_file 단일 파일 상한
+const MAX_SEARCH_FILE_BYTES = 512 * 1024; // search_code에서 스캔할 파일 상한
+const MAX_SCAN_FILES = 5000; // search_code에서 훑을 파일 개수 상한
+const MAX_QUIZ_FILE_BYTES = 40 * 1024; // generate_quiz 자료에 담을 파일당 상한
+const MAX_QUIZ_DIFF_CHARS = 60000; // generate_quiz 자료에 담을 diff 상한
+
+function isSensitiveFile(fileName: string): boolean {
+  return SENSITIVE_FILE_PATTERNS.some((pattern) => pattern.test(fileName));
+}
+
+/**
+ * filePath가 projectPath 밖으로 벗어나지 못하게 막고 절대 경로를 돌려준다.
+ * (../.. 같은 경로로 프로젝트 외부 파일을 읽는 것을 방지)
+ */
+function resolveInside(projectPath: string, filePath: string): string {
+  const root = resolve(projectPath);
+  const target = resolve(root, filePath);
+  if (target !== root && !target.startsWith(root + sep)) {
+    throw new Error(
+      `프로젝트 루트 밖의 경로에는 접근할 수 없습니다: ${filePath}`
+    );
+  }
+  return target;
+}
+
+/** NUL 바이트가 있으면 바이너리로 간주한다 */
+function isProbablyBinary(buffer: Buffer): boolean {
+  const sample = buffer.subarray(0, Math.min(buffer.length, 8000));
+  return sample.includes(0);
+}
+
+interface ReadResult {
+  content: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+/** 텍스트 파일을 상한까지만 읽는다. 바이너리면 예외를 던진다. */
+function readTextFile(absolutePath: string, maxBytes: number): ReadResult {
+  const buffer = readFileSync(absolutePath);
+  if (isProbablyBinary(buffer)) {
+    throw new Error("바이너리 파일은 읽을 수 없습니다.");
+  }
+  const truncated = buffer.length > maxBytes;
+  const slice = truncated ? buffer.subarray(0, maxBytes) : buffer;
+  return {
+    content: slice.toString("utf-8"),
+    bytes: buffer.length,
+    truncated,
+  };
+}
+
+/** 정규식 메타문자를 이스케이프해서 리터럴 검색으로 만든다 */
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** IGNORE_DIRS를 건너뛰며 파일 절대 경로를 모은다 (심볼릭 링크는 순환 방지를 위해 제외) */
+function walkFiles(currentPath: string, acc: string[], limit: number): void {
+  if (acc.length >= limit) {
+    return;
+  }
+
+  let entries;
+  try {
+    entries = readdirSync(currentPath, { withFileTypes: true });
+  } catch {
+    return; // 권한이 없는 디렉토리는 조용히 건너뛴다
+  }
+
+  for (const entry of entries) {
+    if (acc.length >= limit) {
+      return;
+    }
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      if (!IGNORE_DIRS.has(entry.name)) {
+        walkFiles(join(currentPath, entry.name), acc, limit);
+      }
+      continue;
+    }
+    if (entry.isFile()) {
+      acc.push(join(currentPath, entry.name));
+    }
+  }
+}
+
+function textContent(payload: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+  };
+}
+
+function errorContent(message: string) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text" as const,
+        text: message,
+      },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// inspect_project
+// ---------------------------------------------------------------------------
 
 interface TreeNode {
   name: string;
@@ -67,31 +206,25 @@ server.registerTool(
         .optional()
         .describe("탐색할 최대 디렉토리 깊이 (기본값 3)"),
     },
+    annotations: {
+      readOnlyHint: true,
+    },
   },
   async ({ projectPath, maxDepth }) => {
     try {
       const tree = buildTree(projectPath, 0, maxDepth ?? 3);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ root: projectPath, tree }, null, 2),
-          },
-        ],
-      };
+      return textContent({ root: projectPath, tree });
     } catch (err) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `프로젝트 경로를 읽는 데 실패했습니다: ${(err as Error).message}`,
-          },
-        ],
-      };
+      return errorContent(
+        `프로젝트 경로를 읽는 데 실패했습니다: ${(err as Error).message}`
+      );
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// git_diff
+// ---------------------------------------------------------------------------
 
 // git_diff에서 diff 대상을 고르는 옵션
 const DIFF_TARGETS = ["working", "staged", "last-commit"] as const;
@@ -136,6 +269,32 @@ function buildDiffArgs(target: DiffTarget, nameStatus: boolean): string[] {
   }
 }
 
+interface DiffResult {
+  target: DiffTarget;
+  files: DiffFile[];
+  diff: string;
+}
+
+function collectDiff(
+  projectPath: string,
+  target: DiffTarget,
+  filePath?: string
+): DiffResult {
+  const nameStatusArgs = buildDiffArgs(target, true);
+  const diffArgs = buildDiffArgs(target, false);
+
+  if (filePath) {
+    nameStatusArgs.push("--", filePath);
+    diffArgs.push("--", filePath);
+  }
+
+  return {
+    target,
+    files: parseNameStatus(runGit(nameStatusArgs, projectPath)),
+    diff: runGit(diffArgs, projectPath),
+  };
+}
+
 server.registerTool(
   "git_diff",
   {
@@ -153,7 +312,9 @@ server.registerTool(
       filePath: z
         .string()
         .optional()
-        .describe("특정 파일 또는 디렉토리로 diff 범위를 좁힐 때 사용하는 (레포 루트 기준) 상대 경로"),
+        .describe(
+          "특정 파일 또는 디렉토리로 diff 범위를 좁힐 때 사용하는 (레포 루트 기준) 상대 경로"
+        ),
     },
     annotations: {
       readOnlyHint: true,
@@ -163,42 +324,450 @@ server.registerTool(
     const resolvedTarget: DiffTarget = target ?? "working";
 
     try {
-      const nameStatusArgs = buildDiffArgs(resolvedTarget, true);
-      const diffArgs = buildDiffArgs(resolvedTarget, false);
-
-      if (filePath) {
-        nameStatusArgs.push("--", filePath);
-        diffArgs.push("--", filePath);
-      }
-
-      const files = parseNameStatus(runGit(nameStatusArgs, projectPath));
-      const diff = runGit(diffArgs, projectPath);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { root: projectPath, target: resolvedTarget, files, diff },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      const result = collectDiff(projectPath, resolvedTarget, filePath);
+      return textContent({ root: projectPath, ...result });
     } catch (err) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `git diff 실행에 실패했습니다: ${(err as Error).message}`,
-          },
-        ],
-      };
+      return errorContent(
+        `git diff 실행에 실패했습니다: ${(err as Error).message}`
+      );
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// read_file
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "read_file",
+  {
+    title: "Read File",
+    description:
+      "프로젝트 안의 특정 파일 내용을 읽어서 반환합니다. startLine/endLine으로 범위를 좁힐 수 있습니다. 프로젝트 루트 밖의 경로, 바이너리 파일, .env 같은 시크릿 파일은 거부합니다.",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      filePath: z
+        .string()
+        .describe("읽을 파일의 (프로젝트 루트 기준) 상대 경로"),
+      startLine: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("읽기 시작할 줄 번호 (1부터 시작, 기본값 1)"),
+      endLine: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("읽기를 끝낼 줄 번호 (포함, 기본값은 파일 끝)"),
+    },
+    annotations: {
+      readOnlyHint: true,
+    },
+  },
+  async ({ projectPath, filePath, startLine, endLine }) => {
+    try {
+      const absolutePath = resolveInside(projectPath, filePath);
+      const fileName = absolutePath.split(sep).pop() ?? "";
+
+      if (isSensitiveFile(fileName)) {
+        return errorContent(
+          `시크릿이 담길 수 있는 파일이라 읽지 않습니다: ${filePath}`
+        );
+      }
+
+      const stats = statSync(absolutePath);
+      if (!stats.isFile()) {
+        return errorContent(`파일이 아닙니다: ${filePath}`);
+      }
+
+      const { content, bytes, truncated } = readTextFile(
+        absolutePath,
+        MAX_READ_BYTES
+      );
+      const lines = content.split("\n");
+      const totalLines = lines.length;
+
+      const from = Math.min(startLine ?? 1, totalLines);
+      const to = Math.min(endLine ?? totalLines, totalLines);
+
+      if (from > to) {
+        return errorContent(
+          `startLine(${from})이 endLine(${to})보다 클 수 없습니다.`
+        );
+      }
+
+      return textContent({
+        path: filePath,
+        bytes,
+        totalLines,
+        startLine: from,
+        endLine: to,
+        // 파일이 상한(200KB)을 넘어 잘렸다면 그 사실을 명시한다
+        truncatedByteLimit: truncated,
+        content: lines.slice(from - 1, to).join("\n"),
+      });
+    } catch (err) {
+      return errorContent(
+        `파일을 읽는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// search_code
+// ---------------------------------------------------------------------------
+
+interface SearchMatch {
+  path: string;
+  line: number;
+  text: string;
+  before?: string[];
+  after?: string[];
+}
+
+interface SearchOptions {
+  query: string;
+  isRegex: boolean;
+  caseSensitive: boolean;
+  extensions?: string[];
+  maxResults: number;
+  contextLines: number;
+}
+
+function searchProject(projectPath: string, options: SearchOptions) {
+  const root = resolve(projectPath);
+  const files: string[] = [];
+  walkFiles(root, files, MAX_SCAN_FILES);
+
+  const pattern = new RegExp(
+    options.isRegex ? options.query : escapeRegExp(options.query),
+    options.caseSensitive ? "" : "i"
+  );
+
+  const matches: SearchMatch[] = [];
+  let scannedFiles = 0;
+  let truncated = false;
+
+  for (const absolutePath of files) {
+    if (matches.length >= options.maxResults) {
+      truncated = true;
+      break;
+    }
+
+    const fileName = absolutePath.split(sep).pop() ?? "";
+    if (LOCK_FILES.has(fileName) || isSensitiveFile(fileName)) {
+      continue;
+    }
+    if (
+      options.extensions &&
+      !options.extensions.some((ext) => fileName.endsWith(ext))
+    ) {
+      continue;
+    }
+
+    let result: ReadResult;
+    try {
+      if (statSync(absolutePath).size > MAX_SEARCH_FILE_BYTES) {
+        continue;
+      }
+      result = readTextFile(absolutePath, MAX_SEARCH_FILE_BYTES);
+    } catch {
+      continue; // 바이너리이거나 읽을 수 없는 파일은 건너뛴다
+    }
+
+    scannedFiles += 1;
+    const lines = result.content.split("\n");
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      if (!pattern.test(line)) {
+        continue;
+      }
+      if (matches.length >= options.maxResults) {
+        truncated = true;
+        break;
+      }
+
+      const match: SearchMatch = {
+        path: relative(root, absolutePath),
+        line: index + 1,
+        text: line,
+      };
+
+      if (options.contextLines > 0) {
+        match.before = lines.slice(
+          Math.max(0, index - options.contextLines),
+          index
+        );
+        match.after = lines.slice(index + 1, index + 1 + options.contextLines);
+      }
+
+      matches.push(match);
+    }
+  }
+
+  return { scannedFiles, matchCount: matches.length, truncated, matches };
+}
+
+server.registerTool(
+  "search_code",
+  {
+    title: "Search Code",
+    description:
+      "프로젝트 코드베이스에서 키워드나 정규식으로 검색합니다. node_modules 같은 노이즈 디렉토리, lock 파일, 바이너리, .env 같은 시크릿 파일은 자동으로 제외합니다. 특정 개념과 관련된 코드가 어디에 있는지 찾을 때 사용합니다.",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      query: z.string().describe("검색할 문자열 또는 정규식 패턴"),
+      isRegex: z
+        .boolean()
+        .optional()
+        .describe("query를 정규식으로 해석할지 여부 (기본값 false)"),
+      caseSensitive: z
+        .boolean()
+        .optional()
+        .describe("대소문자를 구분할지 여부 (기본값 false)"),
+      extensions: z
+        .array(z.string())
+        .optional()
+        .describe('검색할 확장자 목록 (예: [".ts", ".tsx"]). 생략하면 전체'),
+      maxResults: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe("반환할 최대 매치 수 (기본값 50)"),
+      contextLines: z
+        .number()
+        .int()
+        .min(0)
+        .max(5)
+        .optional()
+        .describe("각 매치의 앞뒤로 함께 반환할 줄 수 (기본값 0)"),
+    },
+    annotations: {
+      readOnlyHint: true,
+    },
+  },
+  async ({
+    projectPath,
+    query,
+    isRegex,
+    caseSensitive,
+    extensions,
+    maxResults,
+    contextLines,
+  }) => {
+    try {
+      const options: SearchOptions = {
+        query,
+        isRegex: isRegex ?? false,
+        caseSensitive: caseSensitive ?? false,
+        maxResults: maxResults ?? 50,
+        contextLines: contextLines ?? 0,
+      };
+      if (extensions) {
+        options.extensions = extensions;
+      }
+
+      const result = searchProject(projectPath, options);
+      return textContent({ root: projectPath, query, ...result });
+    } catch (err) {
+      return errorContent(`검색에 실패했습니다: ${(err as Error).message}`);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// generate_quiz
+//
+// 중요: 이 tool은 질문 문장을 직접 만들지 않는다. 프로젝트의 실제 자료(구조/diff/
+// 파일 내용)를 모아서 반환하고, 질문 생성과 채점은 호출한 쪽(Claude)이 담당한다.
+// 서버는 "무엇을 근거로 물어볼지"와 "어떤 형식으로 답을 만들지"만 정의한다.
+// ---------------------------------------------------------------------------
+
+const QUIZ_SOURCES = ["diff", "files", "structure"] as const;
+type QuizSource = (typeof QUIZ_SOURCES)[number];
+
+const QUIZ_LEVELS = ["awareness", "understanding", "reasoning"] as const;
+
+const QUIZ_INSTRUCTIONS = [
+  "아래 material은 CRDD가 수집한 이 프로젝트의 실제 자료입니다. 다음 규칙에 따라 퀴즈를 생성하세요.",
+  "1. 일반적인 프로그래밍 상식 퀴즈를 만들지 마세요. 반드시 material에 담긴 이 프로젝트의 구조/코드/변경사항에 근거한 질문만 만듭니다.",
+  "2. 각 질문에 이해도 단계(level)를 지정하세요. awareness: 이 코드가 존재하고 어떤 역할인지 아는가 / understanding: 동작 과정과 데이터 흐름을 설명할 수 있는가 / reasoning: 왜 이렇게 설계했는지, 다른 선택지 대비 트레이드오프를 설명할 수 있는가.",
+  "3. 각 질문에 rubric을 반드시 포함하세요. rubric은 '정답에 반드시 포함돼야 하는 핵심 포인트' 목록입니다. 이후 evaluate_answer가 이 rubric으로 채점하므로, 세션이 달라져도 채점 기준이 흔들리지 않도록 구체적으로 작성해야 합니다.",
+  "4. 답을 미리 알려주지 마세요. 질문만 제시하고, 사용자의 답변을 받은 뒤 rubric으로 평가합니다.",
+  "5. material 안에서 근거를 확인할 수 있는 질문만 만드세요. 추측해야만 답할 수 있는 질문은 제외합니다.",
+].join("\n");
+
+const QUIZ_RESPONSE_SCHEMA = {
+  questions: [
+    {
+      id: "q1",
+      level: "understanding (awareness | understanding | reasoning 중 하나)",
+      concept: "이 질문이 속한 개념/영역 이름",
+      question: "사용자에게 보여줄 질문 문장",
+      relatedFiles: ["질문의 근거가 되는 파일 경로"],
+      rubric: ["정답에 반드시 포함돼야 하는 핵심 포인트 1", "핵심 포인트 2"],
+    },
+  ],
+};
+
+interface QuizFileMaterial {
+  path: string;
+  content: string;
+  truncated: boolean;
+  error?: string;
+}
+
+function collectQuizFiles(
+  projectPath: string,
+  filePaths: string[]
+): QuizFileMaterial[] {
+  return filePaths.map((filePath) => {
+    try {
+      const absolutePath = resolveInside(projectPath, filePath);
+      const fileName = absolutePath.split(sep).pop() ?? "";
+      if (isSensitiveFile(fileName)) {
+        return {
+          path: filePath,
+          content: "",
+          truncated: false,
+          error: "시크릿이 담길 수 있는 파일이라 제외했습니다.",
+        };
+      }
+      const { content, truncated } = readTextFile(
+        absolutePath,
+        MAX_QUIZ_FILE_BYTES
+      );
+      return { path: filePath, content, truncated };
+    } catch (err) {
+      return {
+        path: filePath,
+        content: "",
+        truncated: false,
+        error: (err as Error).message,
+      };
+    }
+  });
+}
+
+server.registerTool(
+  "generate_quiz",
+  {
+    title: "Generate Quiz",
+    description:
+      "프로젝트 기반 퀴즈를 만들기 위한 자료를 수집해서 반환합니다. 이 tool 자체는 질문 문장을 만들지 않고, 프로젝트 구조와 (source에 따라) diff 또는 파일 내용, 그리고 질문 생성 규칙과 응답 스키마를 함께 돌려줍니다. 실제 질문 생성은 이 결과를 받은 쪽에서 수행합니다.",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      source: z
+        .enum(QUIZ_SOURCES)
+        .optional()
+        .describe(
+          "퀴즈 자료의 출처. diff: 최근 변경사항 기반(기본값), files: 지정한 파일들의 내용 기반(이미 작성된 코드 학습용), structure: 프로젝트 구조만 기반(콜드 스타트 진단용)"
+        ),
+      target: z
+        .enum(DIFF_TARGETS)
+        .optional()
+        .describe("source가 diff일 때 어떤 변경을 볼지 (기본값 working)"),
+      files: z
+        .array(z.string())
+        .optional()
+        .describe("source가 files일 때 읽을 파일들의 상대 경로 목록"),
+      concept: z
+        .string()
+        .optional()
+        .describe("이 퀴즈가 다루는 개념/영역 이름 (예: Audio Pipeline)"),
+      questionCount: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .describe("생성을 요청할 질문 개수 (기본값 5)"),
+      levels: z
+        .array(z.enum(QUIZ_LEVELS))
+        .optional()
+        .describe("출제할 이해도 단계 목록 (기본값: 세 단계 모두)"),
+    },
+    annotations: {
+      readOnlyHint: true,
+    },
+  },
+  async ({
+    projectPath,
+    source,
+    target,
+    files,
+    concept,
+    questionCount,
+    levels,
+  }) => {
+    const resolvedSource: QuizSource = source ?? "diff";
+
+    try {
+      // 어떤 source든 프로젝트 구조는 배경 맥락으로 항상 포함한다
+      const material: Record<string, unknown> = {
+        structure: buildTree(projectPath, 0, 2),
+      };
+
+      if (resolvedSource === "diff") {
+        const diffResult = collectDiff(projectPath, target ?? "working");
+
+        if (diffResult.files.length === 0) {
+          return errorContent(
+            `변경사항이 없어서 diff 기반 퀴즈를 만들 자료가 없습니다 (target: ${diffResult.target}). 이미 작성된 코드로 퀴즈를 내려면 source를 "files"로, 프로젝트 구조 진단은 "structure"로 호출하세요.`
+          );
+        }
+
+        const diffTruncated = diffResult.diff.length > MAX_QUIZ_DIFF_CHARS;
+        material["diff"] = {
+          target: diffResult.target,
+          files: diffResult.files,
+          truncated: diffTruncated,
+          patch: diffTruncated
+            ? diffResult.diff.slice(0, MAX_QUIZ_DIFF_CHARS)
+            : diffResult.diff,
+        };
+      }
+
+      if (resolvedSource === "files") {
+        if (!files || files.length === 0) {
+          return errorContent(
+            'source가 "files"일 때는 files 파라미터에 읽을 파일 경로를 하나 이상 지정해야 합니다.'
+          );
+        }
+        material["files"] = collectQuizFiles(projectPath, files);
+      }
+
+      const payload: Record<string, unknown> = {
+        projectPath,
+        source: resolvedSource,
+        requestedQuestionCount: questionCount ?? 5,
+        targetLevels: levels ?? [...QUIZ_LEVELS],
+        material,
+        instructions: QUIZ_INSTRUCTIONS,
+        responseSchema: QUIZ_RESPONSE_SCHEMA,
+      };
+      if (concept) {
+        payload["concept"] = concept;
+      }
+
+      return textContent(payload);
+    } catch (err) {
+      return errorContent(
+        `퀴즈 자료를 수집하는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// 서버 기동
+// ---------------------------------------------------------------------------
 
 async function main() {
   const transport = new StdioServerTransport();
