@@ -4,6 +4,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { getStorePath, loadStore, saveStore } from "./storage.js";
 
 const server = new McpServer({
   name: "crdd-mcp",
@@ -241,6 +242,11 @@ function runGit(args: string[], cwd: string): string {
     encoding: "utf-8",
     maxBuffer: 20 * 1024 * 1024,
   });
+}
+
+/** 현재 HEAD commit SHA. generate_quiz가 퀴즈 생성 시점을 기록하기 위해 사용한다. */
+function getHeadSha(projectPath: string): string {
+  return runGit(["rev-parse", "HEAD"], projectPath).trim();
 }
 
 function parseNameStatus(raw: string): DiffFile[] {
@@ -601,6 +607,7 @@ const QUIZ_INSTRUCTIONS = [
   "3. 각 질문에 rubric을 반드시 포함하세요. rubric은 '정답에 반드시 포함돼야 하는 핵심 포인트' 목록입니다. 이후 evaluate_answer가 이 rubric으로 채점하므로, 세션이 달라져도 채점 기준이 흔들리지 않도록 구체적으로 작성해야 합니다.",
   "4. 답을 미리 알려주지 마세요. 질문만 제시하고, 사용자의 답변을 받은 뒤 rubric으로 평가합니다.",
   "5. material 안에서 근거를 확인할 수 있는 질문만 만드세요. 추측해야만 답할 수 있는 질문은 제외합니다.",
+  "6. 사용자 답변을 rubric으로 채점한 뒤에는, 이 응답에 담긴 commit 값을 evaluate_answer의 commit 파라미터로 그대로 넘겨서 채점 결과를 저장하세요.",
 ].join("\n");
 
 const QUIZ_RESPONSE_SCHEMA = {
@@ -709,6 +716,10 @@ server.registerTool(
     const resolvedSource: QuizSource = source ?? "diff";
 
     try {
+      // evaluate_answer가 "이 퀴즈는 어느 commit 시점 코드를 근거로 냈는지"를
+      // 알아야 lastVerifiedCommit을 정확히 기록할 수 있어 항상 같이 반환한다.
+      const commit = getHeadSha(projectPath);
+
       // 어떤 source든 프로젝트 구조는 배경 맥락으로 항상 포함한다
       const material: Record<string, unknown> = {
         structure: buildTree(projectPath, 0, 2),
@@ -745,6 +756,7 @@ server.registerTool(
 
       const payload: Record<string, unknown> = {
         projectPath,
+        commit,
         source: resolvedSource,
         requestedQuestionCount: questionCount ?? 5,
         targetLevels: levels ?? [...QUIZ_LEVELS],
@@ -760,6 +772,160 @@ server.registerTool(
     } catch (err) {
       return errorContent(
         `퀴즈 자료를 수집하는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// evaluate_answer
+//
+// 이 tool은 채점을 하지 않는다. rubric 대비 정답 판정은 generate_quiz와
+// 마찬가지로 호출한 쪽(Claude)이 이미 끝낸 상태로 넘어온다. 서버는 그 결과를
+// storage.ts의 concept/history 스키마에 반영해서 저장하기만 한다.
+// ---------------------------------------------------------------------------
+
+const ANSWER_OUTCOMES = [
+  "first_try",
+  "after_hint",
+  "after_explanation",
+  "unresolved",
+] as const;
+type AnswerOutcome = (typeof ANSWER_OUTCOMES)[number];
+
+// CRDD 오답 처리와 학습 루프 설계: 정답에 도달하기까지 힌트/설명을 거칠수록
+// "스스로 이해한 정도"는 낮다고 보고 배점을 차등한다. 첫 시도 채점과 설명을
+// 읽고 맞춘 채점을 같은 점수로 처리하면 이해도 추이 자체가 무의미해진다.
+const OUTCOME_WEIGHTS: Record<AnswerOutcome, number> = {
+  first_try: 1,
+  after_hint: 0.6,
+  after_explanation: 0.3,
+  unresolved: 0,
+};
+
+server.registerTool(
+  "evaluate_answer",
+  {
+    title: "Evaluate Answer",
+    description:
+      "generate_quiz로 낸 퀴즈에 대해 이미 채점이 끝난 결과를 이해도 점수 저장소에 반영합니다. 이 tool 자체는 채점하지 않습니다 — rubric 대비 정답 여부 판단은 호출한 쪽(Claude)이 끝낸 뒤, 그 결과(개념별 outcome)만 저장합니다.",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      commit: z
+        .string()
+        .describe(
+          "퀴즈가 생성된 시점의 commit SHA (generate_quiz 응답의 commit 값을 그대로 전달)"
+        ),
+      answers: z
+        .array(
+          z.object({
+            concept: z.string().describe("이 답변이 속한 개념/영역 이름"),
+            outcome: z
+              .enum(ANSWER_OUTCOMES)
+              .describe(
+                "first_try: 첫 시도에 정답(배점 1.0) / after_hint: 놓친 포인트를 알려준 뒤 정답(0.6) / after_explanation: 설명을 보고 재답변해서 정답(0.3) / unresolved: 끝까지 rubric을 충족하지 못함(0.0)"
+              ),
+            files: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "이 질문의 근거가 된 파일 경로들 (개념-파일 매핑을 갱신/누적하는 데 사용)"
+              ),
+          })
+        )
+        .min(1)
+        .describe(
+          "이번 퀴즈 세션에서 채점이 끝난 답변들 (한 세션에 여러 개념이 섞여 있어도 됨)"
+        ),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+    },
+  },
+  async ({ projectPath, commit, answers }) => {
+    try {
+      const store = loadStore(projectPath);
+      const now = new Date().toISOString();
+
+      // concept별로 답변을 묶는다 (한 퀴즈 세션이 여러 개념을 다룰 수 있으므로)
+      const grouped = new Map<string, typeof answers>();
+      for (const answer of answers) {
+        const bucket = grouped.get(answer.concept);
+        if (bucket) {
+          bucket.push(answer);
+        } else {
+          grouped.set(answer.concept, [answer]);
+        }
+      }
+
+      const results: Array<{
+        concept: string;
+        scoreBefore: number;
+        scoreAfter: number;
+        delta: number;
+        correct: number;
+        total: number;
+        files: string[];
+        lastVerifiedCommit: string;
+      }> = [];
+
+      for (const [concept, conceptAnswers] of grouped) {
+        const correct = conceptAnswers.reduce(
+          (sum, answer) => sum + OUTCOME_WEIGHTS[answer.outcome],
+          0
+        );
+        const total = conceptAnswers.length;
+        // MVP 점수 공식: 영역별 quiz 문항 수 대비 (배점 반영) 정답 비율.
+        const scoreAfter = Math.round((correct / total) * 100);
+
+        const existing = store.concepts[concept];
+        const scoreBefore = existing?.score ?? 0;
+
+        const newFiles = conceptAnswers.flatMap((answer) => answer.files ?? []);
+        const mergedFiles = Array.from(
+          new Set([...(existing?.files ?? []), ...newFiles])
+        );
+
+        store.concepts[concept] = {
+          score: scoreAfter,
+          files: mergedFiles,
+          lastVerifiedCommit: commit,
+          lastQuizAt: now,
+        };
+
+        store.history.push({
+          at: now,
+          commit,
+          concept,
+          correct,
+          total,
+          scoreBefore,
+          scoreAfter,
+        });
+
+        results.push({
+          concept,
+          scoreBefore,
+          scoreAfter,
+          delta: scoreAfter - scoreBefore,
+          correct,
+          total,
+          files: mergedFiles,
+          lastVerifiedCommit: commit,
+        });
+      }
+
+      saveStore(store);
+
+      return textContent({
+        projectId: store.projectId,
+        storePath: getStorePath(store.projectId),
+        results,
+      });
+    } catch (err) {
+      return errorContent(
+        `채점 결과를 저장하는 데 실패했습니다: ${(err as Error).message}`
       );
     }
   }
