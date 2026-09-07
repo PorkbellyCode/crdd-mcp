@@ -5,6 +5,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { getStorePath, loadStore, saveStore } from "./storage.js";
+import { saveDecision, saveLearningRecord } from "./vault.js";
 
 const server = new McpServer({
   name: "crdd-mcp",
@@ -669,6 +670,7 @@ const QUIZ_SOURCES = ["diff", "files", "structure"] as const;
 type QuizSource = (typeof QUIZ_SOURCES)[number];
 
 const QUIZ_LEVELS = ["awareness", "understanding", "reasoning"] as const;
+type QuizLevel = (typeof QUIZ_LEVELS)[number];
 
 const QUIZ_INSTRUCTIONS = [
   "아래 material은 CRDD가 수집한 이 프로젝트의 실제 자료입니다. 다음 규칙에 따라 퀴즈를 생성하세요.",
@@ -678,6 +680,7 @@ const QUIZ_INSTRUCTIONS = [
   "4. 답을 미리 알려주지 마세요. 질문만 제시하고, 사용자의 답변을 받은 뒤 rubric으로 평가합니다.",
   "5. material 안에서 근거를 확인할 수 있는 질문만 만드세요. 추측해야만 답할 수 있는 질문은 제외합니다.",
   "6. 사용자 답변을 rubric으로 채점한 뒤에는, 이 응답에 담긴 commit 값을 answer의 commit 파라미터로 그대로 넘겨서 채점 결과를 저장하세요.",
+  "7. material의 structure에 표시된 tier/weight는 CRDD가 파일 중요도를 계산하려고 내부적으로 매긴 값입니다. \"왜 이 tier로 분류됐는지\", \"다른 파일과 tier가 왜 다른지\" 같이 이 분류 자체를 묻는 질문은 만들지 마세요 — 이건 프로젝트 지식이 아니라 도구의 계산 근거입니다.",
 ].join("\n");
 
 const QUIZ_RESPONSE_SCHEMA = {
@@ -824,18 +827,45 @@ server.registerTool(
         material["files"] = collectQuizFiles(projectPath, files);
       }
 
+      // structure에는 실제 코드 내용이 없다 — 파일 트리 + tier/weight뿐이므로
+      // understanding/reasoning(동작 과정, 설계 이유)을 물을 근거가 없다.
+      // 근거 없이 내면 tier/weight 분류 자체를 질문 소재로 삼는 식으로 새는 걸
+      // 실제로 관찰했다. 그래서 structure에서는 awareness만 허용한다.
+      const requestedLevels = levels ?? [...QUIZ_LEVELS];
+      let targetLevels: QuizLevel[] = requestedLevels;
+      let levelNote: string | undefined;
+
+      if (resolvedSource === "structure") {
+        const awarenessOnly = requestedLevels.filter(
+          (level) => level === "awareness"
+        );
+        if (awarenessOnly.length === 0) {
+          return errorContent(
+            'source가 "structure"일 때는 파일 내용이 없어 awareness 단계 질문만 낼 수 있습니다. understanding/reasoning 질문을 내려면 source를 "files"로 바꾸고 해당 파일들을 files 파라미터로 지정하세요.'
+          );
+        }
+        targetLevels = awarenessOnly;
+        if (awarenessOnly.length < requestedLevels.length) {
+          levelNote =
+            'structure에는 실제 코드 내용이 없어 understanding/reasoning 단계는 제외하고 awareness만 남겼습니다. 더 깊은 질문이 필요하면 source를 "files"로 다시 호출해 해당 파일 내용을 함께 받으세요.';
+        }
+      }
+
       const payload: Record<string, unknown> = {
         projectPath,
         commit,
         source: resolvedSource,
         requestedQuestionCount: questionCount ?? 5,
-        targetLevels: levels ?? [...QUIZ_LEVELS],
+        targetLevels,
         material,
         instructions: QUIZ_INSTRUCTIONS,
         responseSchema: QUIZ_RESPONSE_SCHEMA,
       };
       if (concept) {
         payload["concept"] = concept;
+      }
+      if (levelNote) {
+        payload["levelNote"] = levelNote;
       }
 
       return textContent(payload);
@@ -1155,6 +1185,127 @@ server.registerTool(
     } catch (err) {
       return errorContent(
         `이해도 점수를 조회하는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// decide / learn
+//
+// 둘 다 채점하거나 판단하지 않는다. 사용자가 자기 말로 쓴 이해를 그대로 마크
+// 다운 파일에 옮겨 적을 뿐이다 (`CRDD 오답 처리와 학습 루프 설계`: "AI가
+// 사용자의 지식 노트를 대신 작성하는 것이 목표가 아니다"). 저장 위치는
+// `claude/CRDD 학습 기록 저장 위치 설계` 문서대로 Obsidian 전용이 아니라
+// 일반 마크다운 폴더(CRDD_VAULT_DIR, 기본 ~/.crdd/notes)다.
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "decide",
+  {
+    title: "Save Decision",
+    description:
+      '설계/구현 결정과 그에 대한 사용자 본인의 이해를 마크다운으로 저장합니다. AI가 대신 써주는 설명이 아니라 사용자가 자기 말로 쓴 내용을 담아야 합니다. 기본적으로 ~/.crdd/notes 아래에 저장되고, CRDD_VAULT_DIR 환경변수로 Obsidian vault 등 원하는 폴더를 지정할 수 있습니다. 같은 제목으로 여러 번 저장해도 기존 파일을 덮어쓰지 않습니다.',
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      title: z
+        .string()
+        .describe(
+          '결정/질문의 제목 (예: "Why do we use Route Handler for transcription?")'
+        ),
+      myUnderstanding: z
+        .string()
+        .describe(
+          "사용자가 자기 말로 쓴 이해 내용 (AI가 대신 작성한 설명을 그대로 넣지 말 것)"
+        ),
+      context: z.string().optional().describe("이 결정이 필요했던 배경/상황"),
+      alternative: z.string().optional().describe("고려했던 다른 대안"),
+      whyRejected: z.string().optional().describe("대안을 채택하지 않은 이유"),
+      verification: z
+        .string()
+        .optional()
+        .describe('검증 근거 (예: "Quiz 4/5, Understanding 78%")'),
+      related: z
+        .array(z.string())
+        .optional()
+        .describe("관련 개념/문서 이름 목록 ([[wikilink]]로 렌더링됨)"),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+    },
+  },
+  async ({
+    projectPath,
+    title,
+    myUnderstanding,
+    context,
+    alternative,
+    whyRejected,
+    verification,
+    related,
+  }) => {
+    try {
+      const result = saveDecision({
+        projectPath,
+        title,
+        myUnderstanding,
+        context,
+        alternative,
+        whyRejected,
+        verification,
+        related,
+      });
+      return textContent(result);
+    } catch (err) {
+      return errorContent(
+        `결정 기록을 저장하는 데 실패했습니다: ${(err as Error).message}`
+      );
+    }
+  }
+);
+
+server.registerTool(
+  "learn",
+  {
+    title: "Save Learning Record",
+    description:
+      "concept에 대해 사용자가 자기 말로 쓴 학습 내용을 마크다운으로 저장합니다(같은 concept이면 한 파일에 계속 append). answer가 갱신하는 점수(JSON)와 달리, 여기엔 왜 그렇게 이해했는지 사용자 본인의 설명이 남아야 합니다.",
+    inputSchema: {
+      projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
+      concept: z.string().describe("이 학습 기록이 속한 개념/영역 이름"),
+      understanding: z
+        .string()
+        .describe(
+          "사용자가 자기 말로 쓴 학습 내용 (AI가 대신 작성한 설명을 그대로 넣지 말 것)"
+        ),
+      verification: z
+        .string()
+        .optional()
+        .describe('검증 근거 (예: "Quiz 4/5, 51% -> 68%")'),
+      related: z
+        .array(z.string())
+        .optional()
+        .describe("관련 개념/문서 이름 목록 ([[wikilink]]로 렌더링됨)"),
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+    },
+  },
+  async ({ projectPath, concept, understanding, verification, related }) => {
+    try {
+      const result = saveLearningRecord({
+        projectPath,
+        concept,
+        understanding,
+        verification,
+        related,
+      });
+      return textContent(result);
+    } catch (err) {
+      return errorContent(
+        `학습 기록을 저장하는 데 실패했습니다: ${(err as Error).message}`
       );
     }
   }
