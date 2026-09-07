@@ -45,11 +45,11 @@ const SENSITIVE_FILE_PATTERNS = [
   /^credentials$/,
 ];
 
-const MAX_READ_BYTES = 200 * 1024; // read_file 단일 파일 상한
-const MAX_SEARCH_FILE_BYTES = 512 * 1024; // search_code에서 스캔할 파일 상한
-const MAX_SCAN_FILES = 5000; // search_code에서 훑을 파일 개수 상한
-const MAX_QUIZ_FILE_BYTES = 40 * 1024; // generate_quiz 자료에 담을 파일당 상한
-const MAX_QUIZ_DIFF_CHARS = 60000; // generate_quiz 자료에 담을 diff 상한
+const MAX_READ_BYTES = 200 * 1024; // read 단일 파일 상한
+const MAX_SEARCH_FILE_BYTES = 512 * 1024; // search에서 스캔할 파일 상한
+const MAX_SCAN_FILES = 5000; // search에서 훑을 파일 개수 상한
+const MAX_QUIZ_FILE_BYTES = 40 * 1024; // quiz 자료에 담을 파일당 상한
+const MAX_QUIZ_DIFF_CHARS = 60000; // quiz 자료에 담을 diff 상한
 
 function isSensitiveFile(fileName: string): boolean {
   return SENSITIVE_FILE_PATTERNS.some((pattern) => pattern.test(fileName));
@@ -158,7 +158,7 @@ function errorContent(message: string) {
 }
 
 // ---------------------------------------------------------------------------
-// inspect_project
+// inspect
 // ---------------------------------------------------------------------------
 
 // CRDD 파일 가중치 설계 — 1단계: 경로 기반 tier.
@@ -262,7 +262,7 @@ function buildTree(
 }
 
 server.registerTool(
-  "inspect_project",
+  "inspect",
   {
     title: "Inspect Project",
     description:
@@ -294,10 +294,10 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// git_diff
+// diff
 // ---------------------------------------------------------------------------
 
-// git_diff에서 diff 대상을 고르는 옵션
+// diff에서 diff 대상을 고르는 옵션
 const DIFF_TARGETS = ["working", "staged", "last-commit"] as const;
 type DiffTarget = (typeof DIFF_TARGETS)[number];
 
@@ -314,7 +314,7 @@ function runGit(args: string[], cwd: string): string {
   });
 }
 
-/** 현재 HEAD commit SHA. generate_quiz가 퀴즈 생성 시점을 기록하기 위해 사용한다. */
+/** 현재 HEAD commit SHA. quiz가 퀴즈 생성 시점을 기록하기 위해 사용한다. */
 function getHeadSha(projectPath: string): string {
   return runGit(["rev-parse", "HEAD"], projectPath).trim();
 }
@@ -372,7 +372,7 @@ function collectDiff(
 }
 
 server.registerTool(
-  "git_diff",
+  "diff",
   {
     title: "Git Diff",
     description:
@@ -411,11 +411,11 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// read_file
+// read
 // ---------------------------------------------------------------------------
 
 server.registerTool(
-  "read_file",
+  "read",
   {
     title: "Read File",
     description:
@@ -493,7 +493,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// search_code
+// search
 // ---------------------------------------------------------------------------
 
 interface SearchMatch {
@@ -589,7 +589,7 @@ function searchProject(projectPath: string, options: SearchOptions) {
 }
 
 server.registerTool(
-  "search_code",
+  "search",
   {
     title: "Search Code",
     description:
@@ -658,7 +658,7 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// generate_quiz
+// quiz
 //
 // 중요: 이 tool은 질문 문장을 직접 만들지 않는다. 프로젝트의 실제 자료(구조/diff/
 // 파일 내용)를 모아서 반환하고, 질문 생성과 채점은 호출한 쪽(Claude)이 담당한다.
@@ -674,10 +674,10 @@ const QUIZ_INSTRUCTIONS = [
   "아래 material은 CRDD가 수집한 이 프로젝트의 실제 자료입니다. 다음 규칙에 따라 퀴즈를 생성하세요.",
   "1. 일반적인 프로그래밍 상식 퀴즈를 만들지 마세요. 반드시 material에 담긴 이 프로젝트의 구조/코드/변경사항에 근거한 질문만 만듭니다.",
   "2. 각 질문에 이해도 단계(level)를 지정하세요. awareness: 이 코드가 존재하고 어떤 역할인지 아는가 / understanding: 동작 과정과 데이터 흐름을 설명할 수 있는가 / reasoning: 왜 이렇게 설계했는지, 다른 선택지 대비 트레이드오프를 설명할 수 있는가.",
-  "3. 각 질문에 rubric을 반드시 포함하세요. rubric은 '정답에 반드시 포함돼야 하는 핵심 포인트' 목록입니다. 이후 evaluate_answer가 이 rubric으로 채점하므로, 세션이 달라져도 채점 기준이 흔들리지 않도록 구체적으로 작성해야 합니다.",
+  "3. 각 질문에 rubric을 반드시 포함하세요. rubric은 '정답에 반드시 포함돼야 하는 핵심 포인트' 목록입니다. 이후 answer가 이 rubric으로 채점하므로, 세션이 달라져도 채점 기준이 흔들리지 않도록 구체적으로 작성해야 합니다.",
   "4. 답을 미리 알려주지 마세요. 질문만 제시하고, 사용자의 답변을 받은 뒤 rubric으로 평가합니다.",
   "5. material 안에서 근거를 확인할 수 있는 질문만 만드세요. 추측해야만 답할 수 있는 질문은 제외합니다.",
-  "6. 사용자 답변을 rubric으로 채점한 뒤에는, 이 응답에 담긴 commit 값을 evaluate_answer의 commit 파라미터로 그대로 넘겨서 채점 결과를 저장하세요.",
+  "6. 사용자 답변을 rubric으로 채점한 뒤에는, 이 응답에 담긴 commit 값을 answer의 commit 파라미터로 그대로 넘겨서 채점 결과를 저장하세요.",
 ].join("\n");
 
 const QUIZ_RESPONSE_SCHEMA = {
@@ -733,7 +733,7 @@ function collectQuizFiles(
 }
 
 server.registerTool(
-  "generate_quiz",
+  "quiz",
   {
     title: "Generate Quiz",
     description:
@@ -786,7 +786,7 @@ server.registerTool(
     const resolvedSource: QuizSource = source ?? "diff";
 
     try {
-      // evaluate_answer가 "이 퀴즈는 어느 commit 시점 코드를 근거로 냈는지"를
+      // answer가 "이 퀴즈는 어느 commit 시점 코드를 근거로 냈는지"를
       // 알아야 lastVerifiedCommit을 정확히 기록할 수 있어 항상 같이 반환한다.
       const commit = getHeadSha(projectPath);
 
@@ -848,9 +848,9 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// evaluate_answer
+// answer
 //
-// 이 tool은 채점을 하지 않는다. rubric 대비 정답 판정은 generate_quiz와
+// 이 tool은 채점을 하지 않는다. rubric 대비 정답 판정은 quiz와
 // 마찬가지로 호출한 쪽(Claude)이 이미 끝낸 상태로 넘어온다. 서버는 그 결과를
 // storage.ts의 concept/history 스키마에 반영해서 저장하기만 한다.
 // ---------------------------------------------------------------------------
@@ -874,17 +874,17 @@ const OUTCOME_WEIGHTS: Record<AnswerOutcome, number> = {
 };
 
 server.registerTool(
-  "evaluate_answer",
+  "answer",
   {
     title: "Evaluate Answer",
     description:
-      "generate_quiz로 낸 퀴즈에 대해 이미 채점이 끝난 결과를 이해도 점수 저장소에 반영합니다. 이 tool 자체는 채점하지 않습니다 — rubric 대비 정답 여부 판단은 호출한 쪽(Claude)이 끝낸 뒤, 그 결과(개념별 outcome)만 저장합니다.",
+      "quiz로 낸 퀴즈에 대해 이미 채점이 끝난 결과를 이해도 점수 저장소에 반영합니다. 이 tool 자체는 채점하지 않습니다 — rubric 대비 정답 여부 판단은 호출한 쪽(Claude)이 끝낸 뒤, 그 결과(개념별 outcome)만 저장합니다.",
     inputSchema: {
       projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
       commit: z
         .string()
         .describe(
-          "퀴즈가 생성된 시점의 commit SHA (generate_quiz 응답의 commit 값을 그대로 전달)"
+          "퀴즈가 생성된 시점의 commit SHA (quiz 응답의 commit 값을 그대로 전달)"
         ),
       answers: z
         .array(
@@ -1002,9 +1002,9 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// measure_understanding
+// score
 //
-// evaluate_answer로 쌓인 concept별 점수/history를 읽기 전용으로 조회한다.
+// answer로 쌓인 concept별 점수/history를 읽기 전용으로 조회한다.
 // 파일 가중치(현재는 경로 기반 tier)를 반영한 overall과
 // Cognitive Debt(=100-overall)를 계산하고, 마지막 검증 이후 매핑된 파일이
 // 바뀐 concept은 stale로 표시한다. stale이어도 점수를 자동으로 깎지는
@@ -1022,7 +1022,7 @@ function computeConceptWeight(files: string[]): number {
 }
 
 server.registerTool(
-  "measure_understanding",
+  "score",
   {
     title: "Measure Understanding",
     description:
@@ -1054,7 +1054,7 @@ server.registerTool(
         return textContent({
           concept,
           found: false,
-          message: `"${concept}" 개념은 아직 검증된 적이 없습니다. generate_quiz로 퀴즈를 내고 evaluate_answer로 채점 결과를 저장하면 여기에 나타납니다.`,
+          message: `"${concept}" 개념은 아직 검증된 적이 없습니다. quiz로 퀴즈를 내고 answer로 채점 결과를 저장하면 여기에 나타납니다.`,
         });
       }
 
@@ -1148,7 +1148,7 @@ server.registerTool(
       };
       if (conceptDetails.length === 0) {
         payload["message"] =
-          "아직 검증된 개념이 없어 이해도 0%(Cognitive Debt 100%)인 시작점입니다. generate_quiz로 퀴즈를 내고 evaluate_answer로 채점 결과를 저장하면 값이 올라갑니다.";
+          "아직 검증된 개념이 없어 이해도 0%(Cognitive Debt 100%)인 시작점입니다. quiz로 퀴즈를 내고 answer로 채점 결과를 저장하면 값이 올라갑니다.";
       }
 
       return textContent(payload);
