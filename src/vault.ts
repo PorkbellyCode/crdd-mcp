@@ -62,11 +62,11 @@ export interface SaveDecisionInput {
   projectPath: string;
   title: string;
   myUnderstanding: string;
-  context?: string;
-  alternative?: string;
-  whyRejected?: string;
-  verification?: string;
-  related?: string[];
+  context?: string | undefined;
+  alternative?: string | undefined;
+  whyRejected?: string | undefined;
+  verification?: string | undefined;
+  related?: string[] | undefined;
 }
 
 /**
@@ -124,8 +124,8 @@ export interface SaveLearningRecordInput {
   projectPath: string;
   concept: string;
   understanding: string;
-  verification?: string;
-  related?: string[];
+  verification?: string | undefined;
+  related?: string[] | undefined;
 }
 
 /**
