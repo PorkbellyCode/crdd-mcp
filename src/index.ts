@@ -682,6 +682,8 @@ const QUIZ_INSTRUCTIONS = [
   "6. 사용자 답변을 rubric으로 채점한 뒤에는, 이 응답에 담긴 commit 값을 answer의 commit 파라미터로 그대로 넘겨서 채점 결과를 저장하세요.",
   "7. material의 structure에 표시된 tier/weight는 CRDD가 파일 중요도를 계산하려고 내부적으로 매긴 값입니다. \"왜 이 tier로 분류됐는지\", \"다른 파일과 tier가 왜 다른지\" 같이 이 분류 자체를 묻는 질문은 만들지 마세요 — 이건 프로젝트 지식이 아니라 도구의 계산 근거입니다.",
   "8. 각 질문에는 판단 근거가 되는 실제 코드를 codeExcerpt로 발췌해서 함께 제시하세요. 사용자가 파일을 직접 열어보지 않아도 질문을 이해하고 답할 수 있어야 합니다. \"이번 diff에서\", \"새로 추가된\" 같은 표현을 쓸 경우 그 변경된 부분(추가/삭제된 줄)을 반드시 발췌에 포함하세요. 발췌는 질문 판단에 필요한 최소 범위로 자르되, 답을 그대로 드러내는 주석이나 커밋 메시지가 포함돼 있다면 제외하거나 가리세요 — 특히 reasoning 질문은 발췌에 답이 그대로 드러나면 문제가 무의미해집니다.",
+  "9. 질문을 한 번에 다 제시하지 마세요. 이 응답의 material로 questionCount개 질문을 모두 미리 구성해두되, 사용자에게는 한 번에 하나씩만 보여주고 답변을 받아 rubric으로 채점(힌트/설명 단계 포함)한 뒤에만 다음 질문으로 넘어가세요. 문항마다 quiz tool을 다시 호출할 필요는 없습니다 — material은 이미 이 응답 안에 다 들어 있으니 그 안에서 순서대로 꺼내 쓰면 됩니다.",
+  "10. 문항을 보여줄 때는 항상 아래 형식을 그대로 따르세요 (세션마다 표현이 달라지지 않도록):\nQuiz — <concept> (<level>) · <순번>/<총문항수>\n\n<질문 문장>\n\n다음 질문의 이 헤더는 현재 문항의 답변과 채점이 모두 끝난 뒤에만 출력하세요.",
 ].join("\n");
 
 const QUIZ_RESPONSE_SCHEMA = {
@@ -906,12 +908,20 @@ const OUTCOME_WEIGHTS: Record<AnswerOutcome, number> = {
   unresolved: 0,
 };
 
+// 퀴즈 한 번 잘 봤다고 concept 점수가 곧장 100점이 되는 문제를 막기 위한
+// 스무딩 상수. 지금까지 이 concept에 대해 답한 전체 문항이 적을수록, 가상의
+// "아직 확인되지 않은" 문항을 total에 얹어서 점수가 서서히만 오르게 한다
+// (베이지안 스무딩과 같은 발상). 값 자체는 실사용하며 조정 대상
+// (`CRDD 이해도 점수 유지 설계` 남은 결정 사항 — 점수 산출 공식).
+const SCORE_SMOOTHING_PSEUDO_TOTAL = 4;
+const SCORE_SMOOTHING_PSEUDO_CORRECT = 0;
+
 server.registerTool(
   "answer",
   {
     title: "Evaluate Answer",
     description:
-      "quiz로 낸 퀴즈에 대해 이미 채점이 끝난 결과를 이해도 점수 저장소에 반영합니다. 이 tool 자체는 채점하지 않습니다 — rubric 대비 정답 여부 판단은 호출한 쪽(Claude)이 끝낸 뒤, 그 결과(개념별 outcome)만 저장합니다.",
+      "quiz로 낸 퀴즈에 대해 이미 채점이 끝난 결과를 이해도 점수 저장소에 반영합니다. 이 tool 자체는 채점하지 않습니다 — rubric 대비 정답 여부 판단은 호출한 쪽(Claude)이 끝낸 뒤, 그 결과(개념별 outcome)만 저장합니다. 응답의 각 결과에는 내부 계산용 score와 함께 부채비율(debtRatioBefore/debtRatioAfter, 100-score)이 포함되니, 사용자에게 결과를 알릴 때는 부채비율만 언급하고 이해도 점수는 언급하지 마세요.",
     inputSchema: {
       projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
       commit: z
@@ -967,6 +977,9 @@ server.registerTool(
         scoreBefore: number;
         scoreAfter: number;
         delta: number;
+        debtRatioBefore: number;
+        debtRatioAfter: number;
+        debtDelta: number;
         correct: number;
         total: number;
         files: string[];
@@ -979,11 +992,31 @@ server.registerTool(
           0
         );
         const total = conceptAnswers.length;
-        // MVP 점수 공식: 영역별 quiz 문항 수 대비 (배점 반영) 정답 비율.
-        const scoreAfter = Math.round((correct / total) * 100);
 
         const existing = store.concepts[concept];
         const scoreBefore = existing?.score ?? 0;
+
+        // MVP 점수 공식(v2): 이번 세션 결과만으로 덮어쓰지 않고, 이 concept에
+        // 대해 지금까지 쌓인 모든 세션(history)의 correct/total을 이번 결과와
+        // 합산한 뒤 비율을 낸다 — "첫 퀴즈 정답 = 즉시 100점"이 되던 문제(이번
+        // 세션 평균을 그대로 store에 덮어쓰던 버그)를 없앤다. 스무딩
+        // pseudo-count를 더해 문항 수가 적을 땐 만점이어도 점수가 서서히만
+        // 오르게 한다.
+        const priorHistory = store.history.filter(
+          (entry) => entry.concept === concept
+        );
+        const priorCorrect = priorHistory.reduce(
+          (sum, entry) => sum + entry.correct,
+          0
+        );
+        const priorTotal = priorHistory.reduce(
+          (sum, entry) => sum + entry.total,
+          0
+        );
+        const smoothedCorrect =
+          priorCorrect + correct + SCORE_SMOOTHING_PSEUDO_CORRECT;
+        const smoothedTotal = priorTotal + total + SCORE_SMOOTHING_PSEUDO_TOTAL;
+        const scoreAfter = Math.round((smoothedCorrect / smoothedTotal) * 100);
 
         const newFiles = conceptAnswers.flatMap((answer) => answer.files ?? []);
         const mergedFiles = Array.from(
@@ -1012,6 +1045,9 @@ server.registerTool(
           scoreBefore,
           scoreAfter,
           delta: scoreAfter - scoreBefore,
+          debtRatioBefore: 100 - scoreBefore,
+          debtRatioAfter: 100 - scoreAfter,
+          debtDelta: (100 - scoreAfter) - (100 - scoreBefore),
           correct,
           total,
           files: mergedFiles,
@@ -1054,12 +1090,34 @@ function computeConceptWeight(files: string[]): number {
   return sum > 0 ? sum : 1;
 }
 
+// score tool 응답을 받은 쪽(Claude)이 세션마다 다른 형태로 표시하지 않도록,
+// 고정 표시 형식을 응답에 함께 실어 보낸다 (`claude/CRDD 표시 포맷과 용어
+// 설계` 문서의 템플릿). concepts 배열은 이미 부채비율 내림차순(score
+// 오름차순)으로 정렬돼 있으므로 그 순서를 그대로 쓰면 된다.
+const SCORE_DISPLAY_GUIDE = [
+  "이 데이터를 사용자에게 보여줄 때는 항상 아래 형식을 그대로 따르세요 (세션마다 표현이 달라지지 않도록). 이해도(understanding score)는 절대 언급하지 마세요 — 부채비율만 단독으로 표기합니다.",
+  "",
+  "CRDD 인지부채 현황",
+  "",
+  "Overall 부채비율: {cognitiveDebt}%",
+  "",
+  "개념              부채비율   비고",
+  "---------------- --------- ----------------",
+  "<concepts 배열 순서 그대로 한 줄씩 — 이미 부채비율 내림차순 정렬됨>",
+  "",
+  "규칙:",
+  "- 퍼센트는 항상 정수로 반올림해서 표시하세요.",
+  "- stale:true인 concept은 비고란에 \"재확인 필요\"라고 표시하세요.",
+  "- 아직 quiz를 한 번도 안 본 concept(콜드 스타트 상태)이 있다면 비고란에 \"콜드 스타트\"라고 표시하세요.",
+  "- 직전 조회 대비 눈에 띄게 달라진 concept이 있으면 마지막 줄에 \"최근 변화: <개념명> {이전}%→{현재}%\" 형태로 한 줄만 덧붙이고, 없으면 생략하세요.",
+].join("\n");
+
 server.registerTool(
   "score",
   {
-    title: "Measure Understanding",
+    title: "Check Cognitive Debt Ratio",
     description:
-      "저장된 이해도 점수(concept별 score)와 파일 가중치를 반영한 overall/Cognitive Debt, 최근 채점 이력을 조회합니다. 마지막 검증 이후 매핑된 파일이 바뀐 concept은 stale로 표시하지만, 점수 자체를 자동으로 깎지는 않습니다 (감쇠 폭 계산 방식은 아직 미정).",
+      "concept별 부채비율(100-이해도)과, 파일 가중치를 반영한 overall 부채비율(Cognitive Debt), 최근 채점 이력을 조회합니다. 마지막 검증 이후 매핑된 파일이 바뀐 concept은 stale로 표시하지만, 점수 자체를 자동으로 깎지는 않습니다 (감쇠 폭 계산 방식은 아직 미정). 응답의 displayGuide에 담긴 형식을 그대로 따라 표시하세요.",
     inputSchema: {
       projectPath: z.string().describe("프로젝트 루트의 절대 경로"),
       concept: z
@@ -1119,6 +1177,7 @@ server.registerTool(
 
         const detail: {
           concept: string;
+          debtRatio: number;
           score: number;
           weight: number;
           files: string[];
@@ -1129,6 +1188,7 @@ server.registerTool(
           staleCheckError?: string;
         } = {
           concept: name,
+          debtRatio: 100 - record.score,
           score: record.score,
           weight,
           files: record.files,
@@ -1174,14 +1234,15 @@ server.registerTool(
       const payload: Record<string, unknown> = {
         projectId: store.projectId,
         storePath: getStorePath(store.projectId),
-        overall,
         cognitiveDebt,
+        overall,
         concepts: conceptDetails,
         recentHistory,
+        displayGuide: SCORE_DISPLAY_GUIDE,
       };
       if (conceptDetails.length === 0) {
         payload["message"] =
-          "아직 검증된 개념이 없어 이해도 0%(Cognitive Debt 100%)인 시작점입니다. quiz로 퀴즈를 내고 answer로 채점 결과를 저장하면 값이 올라갑니다.";
+          "아직 검증된 개념이 없어 부채비율 100%인 시작점입니다. quiz로 퀴즈를 내고 answer로 채점 결과를 저장하면 값이 내려갑니다.";
       }
 
       return textContent(payload);
