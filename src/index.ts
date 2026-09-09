@@ -262,12 +262,33 @@ function buildTree(
     });
 }
 
+// 여러 tool의 표시 지침이 함께 참조하는 diagram-design 플러그인 레퍼런스.
+// (Claude Code 플러그인, https://github.com/cathrynlavery/diagram-design)
+// 서버는 클라이언트에 이 플러그인이 설치돼 있는지 알 방법이 없으므로, 이 상수를
+// 참조하는 모든 지침은 "쓸 수 있으면 활용하고, 없으면 설치를 유도하지 않은 채
+// 기존 텍스트 표시로 자연스럽게 폴백"을 원칙으로 한다 — inspect/quiz/score
+// 세 곳에서 재사용한다.
+const DIAGRAM_SKILL_REF =
+  "diagram-design 스킬(Claude Code 플러그인, https://github.com/cathrynlavery/diagram-design)";
+
+// inspect 응답을 받은 쪽(Claude)이 구조를 표시할 때 diagram-design 스킬이
+// 있으면 활용하고, 없으면 기본 텍스트 트리로 자연스럽게 폴백하도록 안내한다.
+const INSPECT_DISPLAY_GUIDE = [
+  "이 tree를 사용자에게 보여줄 때:",
+  `1. ${DIAGRAM_SKILL_REF}을 사용할 수 있다면, 그 스킬로 이 구조를 다이어그램(트리/레이어 스택/dependency graph 등)으로 시각화해서 보여주세요.`,
+  "2. 스킬이 없거나 사용할 수 없다면 설치를 유도하려 하지 말고, 아래처럼 기본 텍스트 트리로 표시하세요:",
+  "<프로젝트명>/",
+  "├─ src/",
+  "│  └─ index.ts",
+  "└─ ...",
+].join("\n");
+
 server.registerTool(
   "inspect",
   {
     title: "Inspect Project",
     description:
-      "주어진 프로젝트 루트 경로의 디렉토리 구조를 분석해서 반환합니다. node_modules, .git 같은 노이즈 디렉토리는 제외합니다. 각 파일에는 경로 기반 중요도 tier(peripheral/normal)와 weight가 함께 표시됩니다 — 아직 fan-in/경계 파일 보너스는 반영되지 않은 1단계 근사치입니다.",
+      "주어진 프로젝트 루트 경로의 디렉토리 구조를 분석해서 반환합니다. node_modules, .git 같은 노이즈 디렉토리는 제외합니다. 각 파일에는 경로 기반 중요도 tier(peripheral/normal)와 weight가 함께 표시됩니다 — 아직 fan-in/경계 파일 보너스는 반영되지 않은 1단계 근사치입니다. 응답의 displayGuide에 표시 규칙(가능하면 diagram-design 스킬로 시각화, 없으면 텍스트 트리)이 담겨 있습니다.",
     inputSchema: {
       projectPath: z.string().describe("분석할 프로젝트의 절대 경로"),
       maxDepth: z
@@ -285,7 +306,11 @@ server.registerTool(
   async ({ projectPath, maxDepth }) => {
     try {
       const tree = buildTree(projectPath, 0, maxDepth ?? 3);
-      return textContent({ root: projectPath, tree });
+      return textContent({
+        root: projectPath,
+        tree,
+        displayGuide: INSPECT_DISPLAY_GUIDE,
+      });
     } catch (err) {
       return errorContent(
         `프로젝트 경로를 읽는 데 실패했습니다: ${(err as Error).message}`
@@ -684,6 +709,8 @@ const QUIZ_INSTRUCTIONS = [
   "8. 각 질문에는 판단 근거가 되는 실제 코드를 codeExcerpt로 발췌해서 함께 제시하세요. 사용자가 파일을 직접 열어보지 않아도 질문을 이해하고 답할 수 있어야 합니다. \"이번 diff에서\", \"새로 추가된\" 같은 표현을 쓸 경우 그 변경된 부분(추가/삭제된 줄)을 반드시 발췌에 포함하세요. 발췌는 질문 판단에 필요한 최소 범위로 자르되, 답을 그대로 드러내는 주석이나 커밋 메시지가 포함돼 있다면 제외하거나 가리세요 — 특히 reasoning 질문은 발췌에 답이 그대로 드러나면 문제가 무의미해집니다.",
   "9. 질문을 한 번에 다 제시하지 마세요. 이 응답의 material로 questionCount개 질문을 모두 미리 구성해두되, 사용자에게는 한 번에 하나씩만 보여주고 답변을 받아 rubric으로 채점(힌트/설명 단계 포함)한 뒤에만 다음 질문으로 넘어가세요. 문항마다 quiz tool을 다시 호출할 필요는 없습니다 — material은 이미 이 응답 안에 다 들어 있으니 그 안에서 순서대로 꺼내 쓰면 됩니다.",
   "10. 문항을 보여줄 때는 항상 아래 형식을 그대로 따르세요 (세션마다 표현이 달라지지 않도록):\nQuiz — <concept> (<level>) · <순번>/<총문항수>\n\n<질문 문장>\n\n다음 질문의 이 헤더는 현재 문항의 답변과 채점이 모두 끝난 뒤에만 출력하세요.",
+  `11. understanding/reasoning 단계 질문이 여러 파일 간의 관계나 데이터 흐름을 다룬다면, ${DIAGRAM_SKILL_REF}를 사용할 수 있는 경우 관련 구조를 flowchart나 sequence diagram으로 함께 보여줘도 좋습니다 — 단 정답(설계 이유나 결론)이 다이어그램에 드러나지 않게, 구조/흐름 파악에 필요한 정보로만 제한하세요. 스킬을 쓸 수 없다면 설치를 유도하지 말고 텍스트 설명만으로 진행하세요.`,
+  `12. 힌트 이후에도 rubric을 충족하지 못해 설명을 제공할 때(9번의 설명 단계)는, ${DIAGRAM_SKILL_REF}를 사용할 수 있다면 관련 코드의 동작 과정이나 설계 구조를 다이어그램으로 그려서 설명에 곁들이세요. 이 단계는 이미 사용자가 스스로 답하지 못한 뒤이므로, 11번과 달리 다이어그램에 정답(왜 이렇게 설계했는지)이 드러나도 괜찮습니다.`,
 ].join("\n");
 
 const QUIZ_RESPONSE_SCHEMA = {
@@ -1110,6 +1137,8 @@ const SCORE_DISPLAY_GUIDE = [
   "- stale:true인 concept은 비고란에 \"재확인 필요\"라고 표시하세요.",
   "- 아직 quiz를 한 번도 안 본 concept(콜드 스타트 상태)이 있다면 비고란에 \"콜드 스타트\"라고 표시하세요.",
   "- 직전 조회 대비 눈에 띄게 달라진 concept이 있으면 마지막 줄에 \"최근 변화: <개념명> {이전}%→{현재}%\" 형태로 한 줄만 덧붙이고, 없으면 생략하세요.",
+  `- ${DIAGRAM_SKILL_REF}를 사용할 수 있다면, 위 텍스트 표는 그대로 유지한 채 concept별 부채비율을 막대/레이더 차트로, recentHistory의 추이는 타임라인으로 보조 시각화해서 함께 보여주세요. 스킬을 쓸 수 없다면 위 텍스트 표만으로 충분합니다.`,
+  `- concept이 하나도 없는 최초 조회(콜드 스타트)라면, ${DIAGRAM_SKILL_REF}를 사용할 수 있는 경우 CRDD의 학습 루프(Git 변경 → 구조 분석 → 이해도 측정 → Quiz → 학습 → 재평가 → 부채 감소)를 loop/flywheel 다이어그램으로 한 번 보여줘도 좋습니다. 스킬이 없다면 생략하세요.`,
 ].join("\n");
 
 server.registerTool(
